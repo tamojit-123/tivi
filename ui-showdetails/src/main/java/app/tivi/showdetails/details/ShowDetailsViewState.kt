@@ -35,21 +35,7 @@ internal data class ShowDetailsViewState(
     val watchStats: FollowedShowsWatchStats?,
     val seasons: List<SeasonWithEpisodesAndWatches>,
     val refreshing: Boolean,
-) {
-    companion object {
-        val Empty = ShowDetailsViewState(
-            isFollowed = false,
-            show = TiviShow.EMPTY_SHOW,
-            posterImage = null,
-            backdropImage = null,
-            relatedShows = emptyList(),
-            nextEpisodeToWatch = null,
-            watchStats = null,
-            seasons = emptyList(),
-            refreshing = false,
-        )
-    }
-}
+)
 
 internal sealed class ShowDetailsUiEffect {
     data class ShowError(val message: String) : ShowDetailsUiEffect() {

@@ -16,14 +16,16 @@
 
 package app.tivi.showdetails.details
 
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import app.tivi.api.UiError
-import app.tivi.base.InvokeError
-import app.tivi.base.InvokeStarted
-import app.tivi.base.InvokeStatus
-import app.tivi.base.InvokeSuccess
+import app.cash.molecule.AndroidUiDispatcher.Companion.Main
+import app.cash.molecule.launchMolecule
+import app.tivi.data.entities.TiviShow
 import app.tivi.domain.interactors.ChangeSeasonFollowStatus
 import app.tivi.domain.interactors.ChangeSeasonWatchedStatus
 import app.tivi.domain.interactors.ChangeSeasonWatchedStatus.Action
@@ -41,16 +43,13 @@ import app.tivi.domain.observers.ObserveShowImages
 import app.tivi.domain.observers.ObserveShowNextEpisodeToWatch
 import app.tivi.domain.observers.ObserveShowSeasonsEpisodesWatches
 import app.tivi.domain.observers.ObserveShowViewStats
-import app.tivi.extensions.combine
-import app.tivi.ui.SnackbarManager
-import app.tivi.util.Logger
 import app.tivi.util.ObservableLoadingCounter
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -71,12 +70,8 @@ internal class ShowDetailsViewModel @Inject constructor(
     observeShowViewStats: ObserveShowViewStats,
     private val changeShowFollowStatus: ChangeShowFollowStatus,
     private val changeSeasonFollowStatus: ChangeSeasonFollowStatus,
-    private val logger: Logger,
-    private val snackbarManager: SnackbarManager
 ) : ViewModel() {
     private val showId: Long = savedStateHandle.get("showId")!!
-
-    private val loadingState = ObservableLoadingCounter()
 
     private val pendingActions = MutableSharedFlow<ShowDetailsAction>()
 
@@ -84,57 +79,157 @@ internal class ShowDetailsViewModel @Inject constructor(
     val effects: Flow<ShowDetailsUiEffect>
         get() = _effects
 
-    val state = combine(
-        observeShowFollowStatus.flow,
-        observeShowDetails.flow,
-        observeShowImages.flow,
-        loadingState.observable,
-        observeRelatedShows.flow,
-        observeNextEpisodeToWatch.flow,
-        observeShowSeasons.flow,
-        observeShowViewStats.flow,
-    ) { isFollowed, show, showImages, refreshing, relatedShows, nextEpisode, seasons, stats ->
+    // Need to add a MonotonicFrameClock
+    // See: https://github.com/cashapp/molecule/#frame-clock
+    private val moleculeScope = CoroutineScope(viewModelScope.coroutineContext + Main)
+
+    val state: StateFlow<ShowDetailsViewState> = moleculeScope.launchMolecule {
+        val loadingCounter = remember { ObservableLoadingCounter() }
+
+        val isFollowed by observeShowFollowStatus.flow.collectAsState(false)
+        val show by observeShowDetails.flow.collectAsState(TiviShow.EMPTY_SHOW)
+        val showImages by observeShowImages.flow.collectAsState(null)
+        val refreshing by loadingCounter.observable.collectAsState(false)
+        val relatedShows by observeRelatedShows.flow.collectAsState(emptyList())
+        val nextEpisode by observeNextEpisodeToWatch.flow.collectAsState(null)
+        val seasons by observeShowSeasons.flow.collectAsState(emptyList())
+        val stats by observeShowViewStats.flow.collectAsState(null)
+
+        LaunchedEffect(Unit) {
+            pendingActions.collect { action ->
+                when (action) {
+                    is ShowDetailsAction.RefreshAction -> {
+                        loadingCounter.addLoader()
+                        launch {
+                            val result = runCatching {
+                                updateShowDetails.executeSync(
+                                    UpdateShowDetails.Params(showId, action.fromUser)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                            loadingCounter.removeLoader()
+                        }
+
+                        loadingCounter.addLoader()
+                        launch {
+                            val result = runCatching {
+                                updateShowImages.executeSync(
+                                    UpdateShowImages.Params(showId, action.fromUser)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                            loadingCounter.removeLoader()
+                        }
+
+                        loadingCounter.addLoader()
+                        launch {
+                            val result = runCatching {
+                                updateRelatedShows.executeSync(
+                                    UpdateRelatedShows.Params(showId, action.fromUser)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                            loadingCounter.removeLoader()
+                        }
+
+                        loadingCounter.addLoader()
+                        launch {
+                            val result = runCatching {
+                                updateShowSeasons.executeSync(
+                                    UpdateShowSeasonData.Params(showId, action.fromUser)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                            loadingCounter.removeLoader()
+                        }
+                    }
+                    ShowDetailsAction.FollowShowToggleAction -> {
+                        launch {
+                            val result = runCatching {
+                                changeShowFollowStatus.executeSync(
+                                    ChangeShowFollowStatus.Params(showId, TOGGLE)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                        }
+                    }
+                    is ShowDetailsAction.MarkSeasonWatchedAction -> {
+                        launch {
+                            val result = runCatching {
+                                changeSeasonWatchedStatus.executeSync(
+                                    Params(
+                                        seasonId = action.seasonId,
+                                        action = Action.WATCHED,
+                                        onlyAired = action.onlyAired,
+                                        actionDate = action.date
+                                    )
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                        }
+                    }
+                    is ShowDetailsAction.MarkSeasonUnwatchedAction -> {
+                        launch {
+                            val result = runCatching {
+                                changeSeasonWatchedStatus.executeSync(
+                                    Params(seasonId = action.seasonId, action = Action.UNWATCH)
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                        }
+                    }
+                    is ShowDetailsAction.ChangeSeasonFollowedAction -> {
+                        launch {
+                            val result = runCatching {
+                                changeSeasonFollowStatus.executeSync(
+                                    ChangeSeasonFollowStatus.Params(
+                                        seasonId = action.seasonId,
+                                        action = when {
+                                            action.followed -> ChangeSeasonFollowStatus.Action.FOLLOW
+                                            else -> ChangeSeasonFollowStatus.Action.IGNORE
+                                        }
+                                    )
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                        }
+                    }
+                    is ShowDetailsAction.UnfollowPreviousSeasonsFollowedAction -> {
+                        launch {
+                            val result = runCatching {
+                                changeSeasonFollowStatus.executeSync(
+                                    ChangeSeasonFollowStatus.Params(
+                                        seasonId = action.seasonId,
+                                        action = ChangeSeasonFollowStatus.Action.IGNORE_PREVIOUS
+                                    )
+                                )
+                            }
+                            if (result.isFailure) showError(result)
+                        }
+                    }
+                    is ShowDetailsAction.ClearError -> {
+                        launch {
+                            _effects.emit(ShowDetailsUiEffect.ClearError)
+                        }
+                    }
+                }
+            }
+        }
+
         ShowDetailsViewState(
             isFollowed = isFollowed,
             show = show,
-            posterImage = showImages.poster,
-            backdropImage = showImages.backdrop,
+            posterImage = showImages?.poster,
+            backdropImage = showImages?.backdrop,
             relatedShows = relatedShows,
             nextEpisodeToWatch = nextEpisode,
             seasons = seasons,
             watchStats = stats,
             refreshing = refreshing,
         )
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5000),
-        initialValue = ShowDetailsViewState.Empty,
-    )
+    }
 
     init {
-        viewModelScope.launch {
-            pendingActions.collect { action ->
-                when (action) {
-                    is ShowDetailsAction.RefreshAction -> refresh(true)
-                    ShowDetailsAction.FollowShowToggleAction -> onToggleMyShowsButtonClicked()
-                    is ShowDetailsAction.MarkSeasonWatchedAction -> onMarkSeasonWatched(action)
-                    is ShowDetailsAction.MarkSeasonUnwatchedAction -> onMarkSeasonUnwatched(action)
-                    is ShowDetailsAction.ChangeSeasonFollowedAction -> onChangeSeasonFollowState(action)
-                    is ShowDetailsAction.UnfollowPreviousSeasonsFollowedAction -> onUnfollowPreviousSeasonsFollowState(action)
-                    is ShowDetailsAction.ClearError -> snackbarManager.removeCurrentError()
-                }
-            }
-        }
-
-        viewModelScope.launch {
-            snackbarManager.errors.collect {
-                when {
-                    it != null -> _effects.emit(ShowDetailsUiEffect.ShowError(it.message))
-                    else -> _effects.emit(ShowDetailsUiEffect.ClearError)
-                }
-            }
-        }
-
         observeShowFollowStatus(ObserveShowFollowStatus.Params(showId))
         observeShowDetails(ObserveShowDetails.Params(showId))
         observeShowImages(ObserveShowImages.Params(showId))
@@ -143,68 +238,15 @@ internal class ShowDetailsViewModel @Inject constructor(
         observeNextEpisodeToWatch(ObserveShowNextEpisodeToWatch.Params(showId))
         observeShowViewStats(ObserveShowViewStats.Params(showId))
 
-        refresh(false)
-    }
-
-    private fun refresh(fromUser: Boolean) {
-        updateShowDetails(UpdateShowDetails.Params(showId, fromUser)).watchStatus()
-        updateShowImages(UpdateShowImages.Params(showId, fromUser)).watchStatus()
-        updateRelatedShows(UpdateRelatedShows.Params(showId, fromUser)).watchStatus()
-        updateShowSeasons(UpdateShowSeasonData.Params(showId, fromUser)).watchStatus()
-    }
-
-    private fun Flow<InvokeStatus>.watchStatus() = viewModelScope.launch { collectStatus() }
-
-    private suspend fun Flow<InvokeStatus>.collectStatus() = collect { status ->
-        when (status) {
-            InvokeStarted -> loadingState.addLoader()
-            InvokeSuccess -> loadingState.removeLoader()
-            is InvokeError -> {
-                logger.i(status.throwable)
-                snackbarManager.addError(UiError(status.throwable))
-                loadingState.removeLoader()
-            }
-        }
+        // Refresh on start
+        submitAction(ShowDetailsAction.RefreshAction(fromUser = false))
     }
 
     fun submitAction(action: ShowDetailsAction) {
         viewModelScope.launch { pendingActions.emit(action) }
     }
 
-    private fun onToggleMyShowsButtonClicked() {
-        viewModelScope.launch {
-            changeShowFollowStatus(ChangeShowFollowStatus.Params(showId, TOGGLE)).watchStatus()
-        }
-    }
-
-    private fun onMarkSeasonWatched(action: ShowDetailsAction.MarkSeasonWatchedAction) {
-        changeSeasonWatchedStatus(
-            Params(action.seasonId, Action.WATCHED, action.onlyAired, action.date)
-        ).watchStatus()
-    }
-
-    private fun onMarkSeasonUnwatched(action: ShowDetailsAction.MarkSeasonUnwatchedAction) {
-        changeSeasonWatchedStatus(Params(action.seasonId, Action.UNWATCH)).watchStatus()
-    }
-
-    private fun onChangeSeasonFollowState(action: ShowDetailsAction.ChangeSeasonFollowedAction) {
-        changeSeasonFollowStatus(
-            ChangeSeasonFollowStatus.Params(
-                action.seasonId,
-                when {
-                    action.followed -> ChangeSeasonFollowStatus.Action.FOLLOW
-                    else -> ChangeSeasonFollowStatus.Action.IGNORE
-                }
-            )
-        ).watchStatus()
-    }
-
-    private fun onUnfollowPreviousSeasonsFollowState(action: ShowDetailsAction.UnfollowPreviousSeasonsFollowedAction) {
-        changeSeasonFollowStatus(
-            ChangeSeasonFollowStatus.Params(
-                action.seasonId,
-                ChangeSeasonFollowStatus.Action.IGNORE_PREVIOUS
-            )
-        ).watchStatus()
+    private suspend inline fun <T> showError(result: Result<T>) {
+        _effects.emit(ShowDetailsUiEffect.ShowError(result.exceptionOrNull()))
     }
 }
